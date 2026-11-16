@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vue from "@vitejs/plugin-vue";
@@ -103,37 +102,11 @@ export default defineConfig(async () => {
     autoImportPlugin,
     componentsPlugin,
     vueI18nPlugin,
-    {
-      name: "copy-worker",
-      closeBundle() {
-        try {
-          const src = path.resolve(__dirname, "worker.js");
-          // Cloudflare Pages Advanced Mode expects _worker.js
-          const dest = path.resolve(__dirname, "dist/_worker.js");
-          if (fs.existsSync(src)) {
-            if (!fs.existsSync(path.dirname(dest))) {
-              fs.mkdirSync(path.dirname(dest), { recursive: true });
-            }
-            fs.copyFileSync(src, dest);
-            console.log("\n[copy-worker] worker.js copied to dist/_worker.js");
-          } else {
-            console.warn(`\n[copy-worker] worker.js not found at ${src}`);
-          }
-
-          // Workers + Static Assets 部署时，dist/_worker.js 属于 Pages Advanced
-          // Mode 的产物。Wrangler 会把它当静态资源上传，并以"可能暴露服务端代码"
-          // 为由报错。写出 .assetsignore 让它跳过该文件（本地仍保留 _worker.js，
-          // 不影响将来切回 Pages 部署）。
-          const ignoreFile = path.resolve(__dirname, "dist/.assetsignore");
-          fs.writeFileSync(ignoreFile, "_worker.js\n", "utf8");
-          console.log(
-            "\n[copy-worker] wrote dist/.assetsignore (excluded _worker.js from assets)",
-          );
-        } catch (e) {
-          console.error("\n[copy-worker] Error copying worker.js:", e);
-        }
-      },
-    },
+    // Workers + Static Assets 模式下，Worker 入口由 wrangler.toml 的
+    // main = "worker.js" 指定，Wrangler 会自行打包根目录的 worker.js。
+    // 这里不再复制出 dist/_worker.js —— 那是 Pages Advanced Mode 的产物，
+    // 在 Workers 模式下既不会被使用，又会被 Wrangler 当静态资源上传而报
+    // "Uploading a Pages _worker.js file as an asset" 错误。
   ].filter(Boolean);
 
   return {
