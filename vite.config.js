@@ -119,6 +119,16 @@ export default defineConfig(async () => {
           } else {
             console.warn(`\n[copy-worker] worker.js not found at ${src}`);
           }
+
+          // Workers + Static Assets 部署时，dist/_worker.js 属于 Pages Advanced
+          // Mode 的产物。Wrangler 会把它当静态资源上传，并以"可能暴露服务端代码"
+          // 为由报错。写出 .assetsignore 让它跳过该文件（本地仍保留 _worker.js，
+          // 不影响将来切回 Pages 部署）。
+          const ignoreFile = path.resolve(__dirname, "dist/.assetsignore");
+          fs.writeFileSync(ignoreFile, "_worker.js\n", "utf8");
+          console.log(
+            "\n[copy-worker] wrote dist/.assetsignore (excluded _worker.js from assets)",
+          );
         } catch (e) {
           console.error("\n[copy-worker] Error copying worker.js:", e);
         }
