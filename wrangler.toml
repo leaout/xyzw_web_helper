@@ -1,6 +1,15 @@
+# Cloudflare Workers + Static Assets 配置
+# 适配 Workers Builds 的部署命令: npx wrangler deploy
 name = "xyzw-web-helper"
-compatibility_date = "2023-12-01"
+main = "worker.js"
+compatibility_date = "2026-11-16"
 
-[pages_build_config]
-build_command = "npm run build"
-destination_dir = "dist"
+[assets]
+# Vite 构建产物目录（存放 index.html 和 assets/*）
+directory = "./dist"
+# 让 worker.js 里可以用 env.ASSETS.fetch(request) 访问静态资源
+binding = "ASSETS"
+# SPA history 路由回退：未匹配到静态文件的请求统一返回 index.html (200)
+not_found_handling = "single-page-application"
+# 确保 /api/* 一定先经过 Worker（代理），其余路径走静态资源优先
+run_worker_first = ["/api/*"]

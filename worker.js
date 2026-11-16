@@ -82,21 +82,19 @@ export default {
         newHeaders.set(key, value);
       });
 
-      // Special handling for Host header (Cloudflare might override it, but good to set intention)
-      if (proxy.headers.Host) {
-        newHeaders.set("Host", proxy.headers.Host);
-      }
-
-      // Create new request
-      const newRequest = new Request(targetUrl.toString(), {
+      // GET/HEAD 请求不能带 body，否则 new Request 会抛
+      // "Request with GET/HEAD method cannot have body"
+      const init = {
         method: request.method,
         headers: newHeaders,
-        body: request.body,
         redirect: "follow",
-      });
+      };
+      if (!["GET", "HEAD"].includes(request.method)) {
+        init.body = request.body;
+      }
 
       try {
-        const response = await fetch(newRequest);
+        const response = await fetch(targetUrl.toString(), init);
 
         // Re-create response to add CORS headers
         const newResponse = new Response(response.body, response);
@@ -113,8 +111,10 @@ export default {
       }
     }
 
-    // Serve static assets (Cloudflare Pages)
-    // If env.ASSETS is available (e.g. in Cloudflare Pages Functions), use it to fetch static assets
+    // Serve static assets via the Workers assets binding.
+    // SPA history-route fallback is handled by `not_found_handling =
+    // "single-page-application"` in wrangler.toml, so this simply defers
+    // to the assets binding for all non-proxy paths.
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
