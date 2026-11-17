@@ -101,6 +101,9 @@
       <h2>Token管理</h2>
       <TokenManager />
 
+      <h2>后端定时任务</h2>
+      <BackendSyncSettings />
+
       <h2>账户安全</h2>
       <a-card>
         <div class="security-items">
@@ -147,6 +150,7 @@ import { onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { collectFullBackup, downloadBackupFile } from "@/utils/fullBackup";
+import BackendSyncSettings from "@/components/Setting/BackendSyncSettings.vue";
 
 useRouter();
 const message = useMessage();

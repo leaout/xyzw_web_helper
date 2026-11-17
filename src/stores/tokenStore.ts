@@ -19,6 +19,11 @@ import {
   roleIndexFromServerId,
 } from "@/utils/wechatForceLogout";
 import { XyzwWebSocketClient } from "@/utils/xyzwWebSocket";
+import {
+  removeBackendToken,
+  syncAllTokens,
+  syncToken,
+} from "@/utils/backendSync";
 import { $emit, emitPlus } from "./events/index.js";
 
 const { getArrayBuffer, storeArrayBuffer, deleteArrayBuffer, clearAll } =
@@ -245,6 +250,8 @@ export const useTokenStore = defineStore("tokens", () => {
     };
 
     gameTokens.value.push(newToken);
+    // 尽力同步到常驻后端（未配置时静默跳过，不影响导入流程）
+    syncToken(newToken);
     return newToken;
   };
 
@@ -274,6 +281,9 @@ export const useTokenStore = defineStore("tokens", () => {
    */
   const removeToken = async (tokenId: string) => {
     gameTokens.value = gameTokens.value.filter((token) => token.id !== tokenId);
+
+    // 尽力从常驻后端删除
+    removeBackendToken(tokenId);
 
     // 关闭对应的WebSocket连接
     if (wsConnections.value[tokenId]) {
@@ -1661,6 +1671,9 @@ export const useTokenStore = defineStore("tokens", () => {
     updateToken,
     removeToken,
     selectToken,
+
+    // 后端定时任务的 Token 同步（首次配置后手动全量推送）
+    syncAllTokensToBackend: () => syncAllTokens(gameTokens.value),
 
     // Base64解析方法
     parseBase64Token,

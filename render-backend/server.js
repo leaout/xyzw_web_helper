@@ -459,6 +459,40 @@ app.delete("/api/tokens/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
+// 批量同步（upsert）：前端导入 Token 后推送，按 id 存在则更新、不存在则插入。
+// 只接受白名单字段，避免前端误传覆盖 id / created_at 等关键列。
+app.post("/api/tokens/sync", async (req, res) => {
+  const incoming = Array.isArray(req.body?.tokens) ? req.body.tokens : null;
+  if (!incoming) return res.status(400).json({ error: "tokens must be an array" });
+
+  const rows = incoming
+    .filter((t) => t && t.id && t.token)
+    .map((t) => ({
+      id: String(t.id),
+      name: t.name || null,
+      token: t.token,
+      ws_url: t.ws_url ?? t.wsUrl ?? null,
+      server: t.server || null,
+      import_method: t.import_method ?? t.importMethod ?? null,
+      level: t.level || 1,
+      enabled: t.enabled !== false,
+      last_used: t.last_used ?? t.lastUsed ?? null,
+    }));
+
+  if (rows.length === 0) return res.json({ ok: true, count: 0 });
+
+  const { data, error } = await supabase
+    .from("tokens")
+    .upsert(rows, { onConflict: "id" })
+    .select("id");
+  if (error) {
+    addLog("ERROR", "api", "同步tokens失败", { error: error.message });
+    return res.status(400).json({ error: error.message });
+  }
+  addLog("INFO", "api", `同步 ${rows.length} 个tokens`);
+  res.json({ ok: true, count: data?.length ?? rows.length });
+});
+
 app.get("/api/tasks", async (req, res) => {
   const { data, error } = await supabase
     .from("cron_tasks")
