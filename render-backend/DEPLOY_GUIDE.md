@@ -1,157 +1,275 @@
-# 后端定时任务部署指南（不用开浏览器也能自动执行）
+# XYZW 自包含服务部署指南（国内服务器）
 
-这套 `render-backend` 是一个常驻的 Node 服务：它用 `node-cron` 按时间表触发游戏任务，
-通过 WebSocket 直连游戏服务器执行签到、领奖、爬塔等操作。**部署后即使关掉浏览器，
-任务照样按时执行。**
+一个 Node 进程搞定全部：**前端页面 + API 代理 + 定时任务 + SQLite 数据库**。
+部署到一台国内服务器后，浏览器访问一个地址即可使用；关掉浏览器，定时任务照常执行。
+不再依赖 Cloudflare / Supabase / Render 等任何境外服务。
 
-整个链路：
+---
+
+## 0. 架构说明
 
 ```
-浏览器导入 Token ──自动同步──> Supabase.tokens 表
-                                      │
-                         Render 后端每 5 分钟读取配置
-                                      │
-                          cron 到点 → 连游戏 WS → 执行任务 → 写日志
+国内用户浏览器
+      │  https://你的域名/  （同源）
+      ▼
+┌─────────────────────────────────────┐
+│  一个 Node 服务（本目录 server.js）   │
+│  ├─ 静态前端 dist/  + SPA 回退        │
+│  ├─ /api/hortor*  → 代理游戏服务器     │
+│  ├─ /api/tokens, /api/tasks ...      │
+│  ├─ node-cron 定时任务（Asia/Shanghai）│
+│  └─ SQLite 本地数据库 data/xyzw.db    │
+└─────────────────────────────────────┘
 ```
 
----
-
-## 第 1 步：创建 Supabase 项目并建表
-
-1. 去 https://supabase.com 新建一个免费项目（记住区域，选离你近的）。
-2. 左侧 **SQL Editor** → New query → 粘贴 `render-backend/supabase_schema.sql` 全部内容 → Run。
-   执行完应有 `tokens`、`cron_tasks`、`task_logs` 三张表。
-3. 左侧 **Settings → API**，记下两个值，后面要用：
-   - **Project URL**（即 `SUPABASE_URL`）
-   - **service_role** 的 `secret` key（即 `SUPABASE_KEY`，绕过 RLS 最省事）
+数据全部落在服务器本地的 `data/xyzw.db`，单文件、好备份。
 
 ---
 
-## 第 2 步：部署后端到 Render
+## 1. 准备服务器
 
-**方式 A：Blueprint 一键部署（推荐）**
+- 一台国内云服务器（阿里云 / 腾讯云 / 华为云均可），最低 1核1G 足够。
+- 系统建议 Ubuntu 22.04 / Debian 12。
+- **Node.js 18+**（`better-sqlite3` 需要，建议用 Node 20 LTS）。
+- 若要给别人访问，需要**已备案域名**指向这台服务器（国内 80/443 必须备案）；
+  仅自己/内网使用可直接用 IP + 端口，无需域名备案。
 
-1. 打开 https://dashboard.render.com → **New → Blueprint**。
-2. 连接你的 GitHub 账号，选中 `leaout/xyzw_web_helper` 仓库。
-3. Blueprint Path 填 `render-backend/render.yaml`，Apply。
-4. 在面板里补填环境变量：
-   - `SUPABASE_URL` = 第 1 步的 Project URL
-   - `SUPABASE_KEY` = 第 1 步的 service_role key
-   - `API_KEY` = Render 已自动生成，点开复制保存好（前端要用）
-5. 等部署完成，访问 `https://xyzw-backend.onrender.com/health`，
-   看到 `{"status":"ok",...}` 就成功了。记下这个地址。
-
-> 注意：Render 免费层 15 分钟无访问会休眠，唤醒需几十秒。定时任务由服务内部的
-> node-cron 触发，属于进程内部计时，休眠期间不会执行。若要求准时，建议升级付费层
-> （$7/月）或用常驻 VPS。
-
-**方式 B：Web Service 手动创建**
-
-不选 Blueprint，直接 New → Web Service，填：
-
-| 项 | 值 |
-|----|----|
-| Runtime | Node |
-| Root Directory | `render-backend` |
-| Build Command | `npm install` |
-| Start Command | `npm start` |
-| 环境变量 | 同上（PORT 默认 3000） |
-
----
-
-## 第 3 步：前端配置（个人设置页）
-
-1. 打开部署好的网页版工具 → **个人设置**。
-2. 找到新增的 **「后端定时任务同步」** 卡片，打开开关。
-3. 填入：
-   - 后端地址：第 2 步记下的 `https://xyzw-backend.onrender.com`
-   - API 密钥：第 2 步的 `API_KEY`
-4. 点 **测试连接**，提示"连接成功"即配置正确。
-5. 点 **同步全部 Token**，把你浏览器里已有的角色全部推到后端。
-
-之后每次新导入角色，都会自动同步到后端，不用再手动操作。
-
----
-
-## 第 4 步：创建定时任务
-
-任务配置存在 Supabase 的 `cron_tasks` 表。在 **SQL Editor** 里插入，例如：
-
-```sql
-insert into public.cron_tasks (id, name, enabled, cron_expr, selected_tokens, selected_tasks)
-values (
-  'daily-morning',                    -- 任意唯一 id
-  '每日签到挂机',
-  true,
-  '0 8 * * *',                         -- 每天北京时间 8:00（cron 用 5 段，时区 Asia/Shanghai）
-  '["token_xxx_yyy"]'::jsonb,          -- 要执行的 token id 数组（从前端同步过去的 id）
-  '["dailyBundle"]'::jsonb             -- 任务类型 key 数组
-);
-```
-
-**可用任务 key**（来自 `server.js` 的 `TASK_DEFINITIONS`）：
-
-| key | 含义 | key | 含义 |
-|-----|------|-----|------|
-| `signIn` | 签到 | `claimHangup` | 领挂机奖励 |
-| `claimDaily` | 领日常奖励 | `claimDailyPoint` | 领每日积分 |
-| `climbTower` | 爬塔领奖 | `climbWeirdTower` | 怪异塔 |
-| `arenaFight` | 竞技场 | `claimMail` | 领邮件附件 |
-| `legacyHangup` | 功法挂机 | `heroRecruit` | 武将招募 |
-| `studyGame` | 学习问答 | `genieSweep` | 灯神 |
-| `openBox` | 开箱 | `legionSignIn` | 军团签到 |
-| `bossTower` | 咸王宝库 | `mergeBox` | 合并魔盒 |
-| `dailyBundle` | 一键日常（推荐） |  |  |
-
-**cron 表达式**（5 段：分 时 日 月 周，时区固定 Asia/Shanghai）：
-- `0 8 * * *` 每天 8:00
-- `0 8,20 * * *` 每天 8:00 和 20:00
-- `*/30 * * * *` 每 30 分钟
-- `0 9 * * 1` 每周一 9:00
-
-**token id 从哪来**：在 Supabase 表编辑器打开 `tokens` 表，`id` 列就是（形如 `token_1234_abcde`）。
-
-**也可以不写 SQL**：后端提供了 API，用 `curl` 创建任务（把 `<BACKEND_URL>`、`<API_KEY>`、token id 换成你的）：
+安装 Node 20（Ubuntu/Debian）：
 
 ```bash
-curl -X POST https://xyzw-backend.onrender.com/api/tasks \
-  -H 'Content-Type: application/json' \
-  -H 'x-api-key: <API_KEY>' \
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+node -v   # 确认 v20.x
+```
+
+---
+
+## 2. 上传代码并构建前端
+
+把整个仓库放到服务器，例如 `/opt/xyzw`：
+
+```bash
+sudo mkdir -p /opt/xyzw
+cd /opt/xyzw
+# 用 git clone 或 scp 上传，此处以 clone 为例
+git clone https://github.com/leaout/xyzw_web_helper.git .
+```
+
+构建前端（`pnpm` 或 `npm` 均可）：
+
+```bash
+# 用 corepack 启用 pnpm（若没有）
+corepack enable && corepack prepare pnpm@latest --activate
+
+pnpm install
+pnpm build          # 生成 dist/ 目录
+```
+
+确认 `dist/index.html` 已生成。
+
+---
+
+## 3. 配置后端
+
+```bash
+cd /opt/xyzw/render-backend
+pnpm install                 # 安装后端依赖（含 better-sqlite3）
+cp .env.example .env
+nano .env
+```
+
+`.env` 关键项：
+
+```ini
+PORT=3000
+HOST=0.0.0.0
+API_KEY=换成你自己的一长串随机字符串
+# 一般不用改，默认会用 ../dist 和 ./data/xyzw.db
+```
+
+> **API_KEY**：公网部署强烈建议设置。前端设置页要填同一个值。
+> 生成随机串：`openssl rand -hex 24`
+
+先前台跑一次验证：
+
+```bash
+pnpm start
+# 另开一个终端
+curl http://127.0.0.1:3000/health
+# 应返回 {"status":"ok", ... "dbPath": "..."}
+```
+
+看到 `status: ok` 就说明服务正常。浏览器打开 `http://服务器IP:3000` 应能看到前端页面。
+
+---
+
+## 4. （推荐）用 systemd 常驻 + nginx 反代
+
+### 4.1 systemd 开机自启
+
+创建 `/etc/systemd/system/xyzw.service`：
+
+```ini
+[Unit]
+Description=XYZW Self-hosted Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/xyzw/render-backend
+EnvironmentFile=/opt/xyzw/render-backend/.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> `ExecStart` 里的 node 路径用 `which node` 查到的实际路径替换。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now xyzw
+sudo systemctl status xyzw      # 确认 active (running)
+sudo journalctl -u xyzw -f      # 实时看日志
+```
+
+### 4.2 nginx 反向代理 + HTTPS
+
+有域名的话用 nginx 反代到 3000 端口，并配证书（如 Let's Encrypt）：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name 你的域名;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    client_max_body_size 8m;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_read_timeout 120s;   # 代理游戏接口可能需要较长超时
+    }
+}
+
+server {
+    listen 80;
+    server_name 你的域名;
+    return 301 https://$host$request_uri;
+}
+```
+
+`sudo nginx -t && sudo systemctl reload nginx`，然后浏览器访问 `https://你的域名`。
+
+---
+
+## 5. 前端开启同步
+
+1. 打开站点 → **个人设置** → 「后端定时任务同步」卡片
+2. 打开开关
+3. **后端地址留空**（同源部署自动用当前站点）
+4. 填入第 3 步设的 `API_KEY`
+5. 点「测试连接」→ 显示成功即可
+6. 点「同步全部 Token」→ 把浏览器里已有的角色推到后端
+
+之后在浏览器导入新 Token 也会自动同步。
+
+---
+
+## 6. 创建定时任务
+
+定时任务存在 SQLite 里。用 API 创建最直接（替换 `<API_KEY>`）：
+
+```bash
+# 每天 08:00 对某角色执行「一键日常」
+curl -X POST http://127.0.0.1:3000/api/tasks \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <API_KEY>" \
   -d '{
-    "id": "daily-morning",
-    "name": "每日签到挂机",
+    "id": "daily-0800",
+    "name": "每日一键日常",
     "enabled": true,
     "cron_expr": "0 8 * * *",
-    "selected_tokens": ["token_xxx_yyy"],
+    "selected_tokens": ["这里填token的id"],
     "selected_tasks": ["dailyBundle"]
   }'
 ```
 
+- `cron_expr` 是 5 段 cron，时区固定 `Asia/Shanghai`。
+- `selected_tokens`：token 的 id 数组（可在前端同步后从 `/api/tokens` 查）。
+- `selected_tasks`：任务 key 数组，可选值见 `GET /api/task-definitions`，常用的有：
+  `signIn`、`claimHangup`、`claimMail`、`climbTower`、`arenaFight`、
+  `legacyHangup`、`bossTower`、`legionSignIn`、`dailyBundle` 等。
+
+立即手动触发一次（验证能不能跑通）：
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tasks/daily-0800/run \
+  -H "x-api-key: <API_KEY>"
+```
+
+查看执行日志：
+
+```bash
+curl http://127.0.0.1:3000/api/logs/db?limit=50 -H "x-api-key: <API_KEY>"
+```
+
+也随时可以 `sudo journalctl -u xyzw -f` 看实时日志。
+
 ---
 
-## 第 5 步：验证
+## 7. 数据备份
 
-- `GET /health`：看 `activeCrons` 是否等于你启用的任务数。
-- `GET /api/logs`（带 x-api-key）：看任务执行日志。
-- Supabase `task_logs` 表：每条命令的成功/失败记录。
-- 后端每 5 分钟自动重载一次 `cron_tasks`，改完配置最多等 5 分钟生效（重启服务可立即生效）。
+SQLite 是单文件，直接复制即可（建议停服或低峰期）：
+
+```bash
+cp /opt/xyzw/render-backend/data/xyzw.db /备份路径/xyzw-$(date +%F).db
+```
+
+配合 crontab 每天自动备份：
+
+```bash
+0 3 * * * cp /opt/xyzw/render-backend/data/xyzw.db /backup/xyzw-$(date +\%F).db
+```
 
 ---
 
-## 常见问题
+## 8. 常见问题
 
-**Q：Token 会过期吗？要重新导入吗？**
-A：BIN/扫码/手机号/URL 导入的 token 是长期有效的（前端 `cleanExpiredTokens` 不会清理它们）。
-若游戏侧踢下线导致 token 失效，需要重新导入，前端会自动同步覆盖。
+- **页面能开但登录/验证码失败**：检查代理是否正常——看 `journalctl` 里有没有
+  `[proxy] 代理失败`，多为服务器无法访问游戏/微信域名或超时，可调大 `PROXY_TIMEOUT_MS`。
+- **定时任务没执行**：确认 `enabled=true`、cron 表达式正确、token 已同步且 `enabled`，
+  并看 `/health` 的 `activeCrons` 是否 > 0。改配置后最多 5 分钟自动重载。
+- **Token 同步 401**：前端填的 API_KEY 与后端 `.env` 不一致。
+- **WAL 文件**：data 目录下出现 `xyzw.db-wal`/`xyzw.db-shm` 是正常的，备份时三个一起拷更稳妥。
+- **前端构建产物更新**：每次改前端代码后要在服务器重新 `pnpm build`，并重启服务或刷新。
 
-**Q：前端关了，token 同步还能用吗？**
-A：同步只在导入/删除时发生。关掉浏览器不影响后端执行已同步的 token。
+---
 
-**Q：一个任务能对多个角色执行吗？**
-A：能。`selected_tokens` 是数组，后端会逐个连接执行，每个角色间隔 2 秒。
+## 9. API 一览
 
-**Q：想立刻跑一次测试怎么办？**
-A：`POST /api/tasks/<任务id>/run`（带 x-api-key），或在 Supabase 里手动改。
+| 方法 | 路径 | 说明 | 鉴权 |
+|---|---|---|---|
+| GET | `/health` | 健康检查 | 否 |
+| GET | `/api/tokens` | 列出 token | 是* |
+| POST | `/api/tokens/sync` | 批量 upsert（前端同步用） | 是* |
+| DELETE | `/api/tokens/:id` | 删除 token | 是* |
+| GET | `/api/tasks` | 列出定时任务 | 是* |
+| POST | `/api/tasks` | 新建定时任务 | 是* |
+| PATCH | `/api/tasks/:id` | 修改定时任务 | 是* |
+| DELETE | `/api/tasks/:id` | 删除定时任务 | 是* |
+| POST | `/api/tasks/:id/run` | 立即执行 | 是* |
+| GET | `/api/logs` / `/api/logs/db` | 执行日志 | 是* |
+| GET | `/api/task-definitions` | 任务类型清单 | 是* |
 
-**Q：Render 免费层休眠导致定时任务不执行？**
-A：升级到付费层（$7/月）保持常驻，或改用一台 VPS/Cloudflare 之外的常驻主机。
+\* 配置了 API_KEY 时需要，未配置则免鉴权。
+
+（说明：本工具涉及游戏协议自动化与 Token 模拟登录，账号与合规风险请自行评估。）

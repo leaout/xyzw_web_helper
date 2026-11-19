@@ -8,19 +8,19 @@
     </template>
 
     <a-alert type="info" style="margin-bottom: 16px">
-      配置常驻后端后，导入的角色 Token 会自动同步过去，即使关闭浏览器，
-      后端也能按定时任务继续执行。未开启时不影响任何现有功能。
+      自包含部署下前端与后端同域名，开启后只需填写 API 密钥即可。导入的角色 Token
+      会自动同步，即使关闭浏览器，后端也能按定时任务继续执行。未开启时不影响任何现有功能。
     </a-alert>
 
     <a-form :model="cfg" label-placement="left" label-width="100px">
       <a-form-item label="后端地址">
         <a-input
           v-model="cfg.baseUrl"
-          placeholder="https://xyzw-backend.onrender.com"
+          placeholder="留空 = 使用当前站点（同源部署）"
           :disabled="!cfg.enabled"
           allow-clear
         />
-        <template #help>Render 部署后给你的服务地址，末尾不要带斜杠</template>
+        <template #help>同源部署留空即可；前后端分离时填后端完整地址，末尾不带斜杠</template>
       </a-form-item>
 
       <a-form-item label="API 密钥">
@@ -73,7 +73,9 @@ function persist() {
 
 function onToggle(val) {
   persist();
-  Message.info(val ? "后端同步已开启，记得填写地址并测试连接" : "后端同步已关闭");
+  Message.info(
+    val ? "后端同步已开启，填写 API 密钥后点「测试连接」验证" : "后端同步已关闭",
+  );
 }
 
 async function onTest() {
