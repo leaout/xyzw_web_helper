@@ -23,6 +23,7 @@ import {
   removeBackendToken,
   syncAllTokens,
   syncToken,
+  syncTokenWithCredential,
 } from "@/utils/backendSync";
 import { $emit, emitPlus } from "./events/index.js";
 
@@ -250,8 +251,14 @@ export const useTokenStore = defineStore("tokens", () => {
     };
 
     gameTokens.value.push(newToken);
-    // 尽力同步到常驻后端（未配置时静默跳过，不影响导入流程）
-    syncToken(newToken);
+    // 尽力同步到常驻后端（未配置时静默跳过，不影响导入流程）。
+    // 用 setTimeout 延迟一拍，等各导入表单把原始 bin 写入 IndexedDB 后再读，
+    // 这样后端能拿到续期凭证；读不到 bin 也会退化为只同步 token 元数据。
+    setTimeout(() => {
+      syncTokenWithCredential(newToken, (tid) => getArrayBuffer(tid)).catch(
+        () => {},
+      );
+    }, 300);
     return newToken;
   };
 
@@ -1672,8 +1679,9 @@ export const useTokenStore = defineStore("tokens", () => {
     removeToken,
     selectToken,
 
-    // 后端定时任务的 Token 同步（首次配置后手动全量推送）
-    syncAllTokensToBackend: () => syncAllTokens(gameTokens.value),
+    // 后端定时任务的 Token 同步（含原始 bin 凭证，供后端自动续期）
+    syncAllTokensToBackend: () =>
+      syncAllTokens(gameTokens.value, (tid) => getArrayBuffer(tid)),
 
     // Base64解析方法
     parseBase64Token,

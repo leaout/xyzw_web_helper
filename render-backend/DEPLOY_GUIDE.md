@@ -184,6 +184,42 @@ server {
 
 ---
 
+## 5.5 完全后台：Token 自动续期（重点）
+
+这个服务**不需要一直开着浏览器**。任务执行、定时调度、Token 续期全部在后端完成。
+原理是：任何导入方式（bin / 扫码 / 手机 / URL）最终都会产出一份**原始 bin 凭证**，
+前端会把它（base64）连同 `sourceUrl` 等一起同步到后端。后端凭这些凭证，
+自己调用游戏的 `login/authuser` 接口换取新的 roleToken——和浏览器里的
+`transformToken()` 逻辑完全一致。
+
+### 续期是如何工作的
+
+1. **执行前**：若某 token 距上次刷新超过 12 小时，后端先用凭证换新 roleToken 再执行。
+2. **执行中**：若连接报「token 过期/失效」，后端自动强制刷新一次并重试。
+3. **无凭证**：没有 bin/sourceUrl 的 token（如纯手动导入）无法续期，只能用导入时的
+   roleToken，过期后需重新导入。
+
+### 确保自动续期生效的注意事项
+
+- **导入时不要勾选「强制下线账号」**（扫码/手机表单里的 `saveCombUser` 选项）。
+  勾选后前端只保存 combUser、不保存 bin，而 combUser 重建 bin 依赖浏览器加密模块，
+  后端无法完成 → 这类 token 无法自动续期。默认不勾选，正常都能续期。
+- **开启同步后，务必点一次「同步全部 Token」**：这一步会把已导入角色的 bin 凭证
+  一并推送到后端。仅靠自动同步钩子，旧 token 可能没带上 bin。
+- URL 导入方式只要 `sourceUrl` 长期有效，后端就能一直续期，最省事。
+- 续期需要后端服务器能访问 `xxz-xyzw.hortorgames.com`（国内服务器通常可达）。
+
+### 查看某 token 是否具备续期能力
+
+```bash
+curl -H "x-api-key: <API_KEY>" http://127.0.0.1:3000/api/tokens | \
+  jq '.[] | {name, has_bin: (.bin_data != null), has_url: (.source_url != null), last_refreshed}'
+```
+
+`has_bin` 或 `has_url` 至少有一个为 true，才支持自动续期。
+
+---
+
 ## 6. 创建定时任务
 
 定时任务存在 SQLite 里。用 API 创建最直接（替换 `<API_KEY>`）：

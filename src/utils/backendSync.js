@@ -51,8 +51,24 @@ export function setBackendSyncConfig(cfg) {
   return normalized;
 }
 
-/** 前端 TokenData -> 后端 tokens 表行 */
-function toBackendRow(t) {
+/** ArrayBuffer -> base64（用于把原始 bin 凭证同步给后端做自动续期） */
+export function arrayBufferToBase64(buffer) {
+  if (!buffer) return null;
+  try {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  } catch {
+    return null;
+  }
+}
+
+/** 前端 TokenData -> 后端 tokens 表行（含自动续期凭证） */
+function toBackendRow(t, binBase64 = null) {
   return {
     id: String(t.id),
     name: t.name || null,
@@ -63,6 +79,13 @@ function toBackendRow(t) {
     level: t.level || 1,
     enabled: t.enabled !== false,
     last_used: t.lastUsed || t.createdAt || null,
+    // —— 自动续期凭证 ——
+    source_url: t.sourceUrl || null,
+    comb_user: t.combUser ? JSON.stringify(t.combUser) : null,
+    bin_data: binBase64 || t.binData || null,
+    role_id: t.roleId != null ? String(t.roleId) : null,
+    server_id: t.serverId != null ? String(t.serverId) : null,
+    role_index: t.roleIndex != null ? Number(t.roleIndex) : null,
   };
 }
 
@@ -96,16 +119,49 @@ async function post(path, body) {
   }
 }
 
-/** 新增/更新单个 Token（后端按 id upsert） */
-export async function syncToken(token) {
+/** 新增/更新单个 Token（后端按 id upsert）；binBase64 为可选原始凭证 */
+export async function syncToken(token, binBase64 = null) {
   if (!token?.id || !token?.token) return null;
-  return post("/api/tokens/sync", { tokens: [toBackendRow(token)] });
+  return post("/api/tokens/sync", {
+    tokens: [toBackendRow(token, binBase64)],
+  });
 }
 
-/** 首次启用时，把当前所有 Token 一次性推送到后端 */
-export async function syncAllTokens(tokens) {
+/**
+ * 带完整凭证的单个同步：由 tokenStore 在读到此 token 的原始 bin 后调用。
+ * getBin(tokenId) 为异步函数，返回 ArrayBuffer 或 null。
+ */
+export async function syncTokenWithCredential(token, getBin) {
+  let binBase64 = null;
+  try {
+    const ab = typeof getBin === "function" ? await getBin(token.id) : null;
+    if (ab) binBase64 = arrayBufferToBase64(ab);
+  } catch (e) {
+    console.warn("[backendSync] 读取 bin 凭证失败:", e?.message || e);
+  }
+  return syncToken(token, binBase64);
+}
+
+/**
+ * 首次启用时，把当前所有 Token 一次性推送到后端（含原始 bin 凭证）。
+ * getBin(tokenId) 为异步函数；token 里已有 binData 的也会带上。
+ */
+export async function syncAllTokens(tokens, getBin = null) {
   if (!Array.isArray(tokens) || tokens.length === 0) return null;
-  return post("/api/tokens/sync", { tokens: tokens.map(toBackendRow) });
+  const rows = [];
+  for (const t of tokens) {
+    let binBase64 = t.binData || null;
+    if (!binBase64 && typeof getBin === "function") {
+      try {
+        const ab = await getBin(t.id);
+        if (ab) binBase64 = arrayBufferToBase64(ab);
+      } catch (e) {
+        console.warn(`[backendSync] 读取 ${t.id} bin 失败:`, e?.message || e);
+      }
+    }
+    rows.push(toBackendRow(t, binBase64));
+  }
+  return post("/api/tokens/sync", { tokens: rows });
 }
 
 /** 删除单个 Token（fire-and-forget） */

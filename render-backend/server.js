@@ -9,6 +9,7 @@ import cron from "node-cron";
 import { createApiKeyMiddleware } from "./lib/apiKeyAuth.js";
 import { GameClient } from "./lib/gameClient.js";
 import { createProxyMiddleware } from "./lib/proxy.js";
+import { refreshToken, canRefresh } from "./lib/tokenRefresh.js";
 import * as db from "./lib/db.js";
 
 /**
@@ -212,69 +213,131 @@ async function executeTask(task) {
     taskId: task.id,
   });
 
-  for (const token of targetTokens) {
-    let tokenData;
-    try {
-      tokenData =
-        typeof token.token === "string" && token.token.startsWith("{")
-          ? JSON.parse(token.token)
-          : {
-              roleToken: token.token,
-              roleId: token.roleId,
-              sessId: token.sessId,
-              connId: token.connId,
-              isRestore: token.isRestore,
-            };
-      tokenData.name = token.name;
-    } catch (err) {
-      addLog("ERROR", "task", `Token解析失败: ${token.name}`, {
-        error: err.message,
-      });
-      continue;
-    }
+  // 主动续期间隔：距上次刷新超过 12 小时才在执行前换新，避免频繁打 authuser
+  const REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+  const isRefreshDue = (row) => {
+    if (!canRefresh(row)) return false;
+    if (!row.last_refreshed) return true;
+    return Date.now() - new Date(row.last_refreshed).getTime() > REFRESH_INTERVAL_MS;
+  };
+  const looksExpired = (msg) =>
+    /expired|token|auth|登录|失效|过期|踢|kick/i.test(String(msg));
 
-    const client = new GameClient(tokenData, token.ws_url);
+  // 把 db 行解析成 GameClient 需要的 tokenData
+  const parseTokenRow = (row) => {
+    const data =
+      typeof row.token === "string" && row.token.startsWith("{")
+        ? JSON.parse(row.token)
+        : {
+            roleToken: row.token,
+            roleId: row.roleId,
+            sessId: row.sessId,
+            connId: row.connId,
+            isRestore: row.isRestore,
+          };
+    data.name = row.name;
+    return data;
+  };
+
+  // 单次连接 + 批量执行；疑似 token 失效时抛出，交给上层刷新重试
+  const runBatch = async (row) => {
+    const tokenData = parseTokenRow(row);
+    const client = new GameClient(tokenData, row.ws_url);
     try {
       await client.connect(15000);
       try {
         await client.sendWithPromise("role_getroleinfo", {}, 8000);
         await sleep(500);
       } catch (e) {
-        addLog("WARN", "task", `获取角色信息失败 (${token.name})`, {
+        if (looksExpired(e.message)) throw e;
+        addLog("WARN", "task", `获取角色信息失败 (${row.name})`, {
           error: e.message,
         });
       }
-
-      const cmdResults = await client.executeBatch(allCommands, 800);
-      for (const r of cmdResults) {
-        addLog(
-          r.success ? "INFO" : "ERROR",
-          "task",
-          `[${token.name}] ${r.cmd}: ${r.success ? "OK" : r.error}`,
-          { taskId: task.id },
-        );
-        db.insertLog({
-          task_id: task.id,
-          token_name: token.name,
-          task_type: r.cmd,
-          status: r.success ? "success" : "error",
-          message: r.success ? null : r.error,
-        });
-      }
-    } catch (err) {
-      addLog("ERROR", "task", `执行失败 (${token.name}): ${err.message}`, {
-        taskId: task.id,
-      });
-      db.insertLog({
-        task_id: task.id,
-        token_name: token.name,
-        task_type: taskKeys.join(","),
-        status: "error",
-        message: err.message,
-      });
+      return await client.executeBatch(allCommands, 800);
     } finally {
       client.disconnect();
     }
+  };
+
+  for (const token of targetTokens) {
+    let workingToken = token;
+
+    // 1) 到期主动续期（有凭证且距上次刷新较久才续）
+    if (isRefreshDue(token)) {
+      try {
+        const refreshed = await refreshToken(token);
+        const updated = db.updateTokenCredential(token.id, {
+          token: refreshed.token,
+        });
+        workingToken = updated || { ...token, token: refreshed.token };
+        addLog(
+          "INFO",
+          "task",
+          `Token 续期成功 (${token.name}) [via ${refreshed.via}]`,
+          { taskId: task.id },
+        );
+      } catch (e) {
+        addLog(
+          "WARN",
+          "task",
+          `Token 续期失败，使用现有凭证 (${token.name}): ${e.message}`,
+          { taskId: task.id },
+        );
+      }
+    }
+
+    // 2) 执行；疑似过期则强制刷新后再试一次
+    let cmdResults;
+    try {
+      cmdResults = await runBatch(workingToken);
+    } catch (err) {
+      if (looksExpired(err.message) && canRefresh(workingToken)) {
+        try {
+          addLog("INFO", "task", `疑似 token 过期，强制刷新重试 (${token.name})`, {
+            taskId: task.id,
+          });
+          const refreshed = await refreshToken(workingToken);
+          const updated = db.updateTokenCredential(token.id, {
+            token: refreshed.token,
+          });
+          workingToken = updated || { ...workingToken, token: refreshed.token };
+          cmdResults = await runBatch(workingToken);
+        } catch (retryErr) {
+          cmdResults = [
+            {
+              cmd: taskKeys.join(","),
+              success: false,
+              error: `刷新重试仍失败: ${retryErr.message}`,
+            },
+          ];
+        }
+      } else {
+        cmdResults = [
+          { cmd: taskKeys.join(","), success: false, error: err.message },
+        ];
+      }
+    }
+
+    // 3) 落库执行结果
+    for (const r of cmdResults) {
+      addLog(
+        r.success ? "INFO" : "ERROR",
+        "task",
+        `[${token.name}] ${r.cmd}: ${r.success ? "OK" : r.error}`,
+        { taskId: task.id },
+      );
+      db.insertLog({
+        task_id: task.id,
+        token_name: token.name,
+        task_type: r.cmd,
+        status: r.success ? "success" : "error",
+        message: r.success ? null : r.error,
+      });
+    }
+
+    // 记录本次使用时间
+    db.updateTokenLastUsed(token.id);
     await sleep(2000);
   }
 
@@ -400,6 +463,24 @@ app.post("/api/tokens/sync", (req, res) => {
       level: t.level || 1,
       enabled: t.enabled !== false,
       last_used: t.last_used ?? t.lastUsed ?? null,
+      // 自动续期凭证
+      source_url: t.source_url ?? t.sourceUrl ?? null,
+      comb_user:
+        typeof t.comb_user === "string"
+          ? t.comb_user
+          : t.combUser
+            ? JSON.stringify(t.combUser)
+            : null,
+      bin_data: t.bin_data ?? t.binData ?? null,
+      role_id: (() => {
+        const v = t.role_id ?? t.roleId;
+        return v != null ? String(v) : null;
+      })(),
+      server_id: (() => {
+        const v = t.server_id ?? t.serverId;
+        return v != null ? String(v) : null;
+      })(),
+      role_index: t.role_index ?? t.roleIndex ?? null,
     }));
   if (rows.length === 0) return res.json({ ok: true, count: 0 });
   try {

@@ -40,7 +40,15 @@ db.exec(`
     import_method TEXT,
     enabled       INTEGER DEFAULT 1,
     created_at    TEXT,
-    last_used     TEXT
+    last_used     TEXT,
+    -- 自动续期所需凭证（逐步迁移：老库缺列时由下方 ALTER 补齐）
+    source_url    TEXT,
+    comb_user     TEXT,
+    bin_data      TEXT,
+    role_id       TEXT,
+    server_id     TEXT,
+    role_index    INTEGER,
+    last_refreshed TEXT
   );
 
   CREATE TABLE IF NOT EXISTS cron_tasks (
@@ -71,6 +79,27 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tasks_enabled ON cron_tasks(enabled);
   CREATE INDEX IF NOT EXISTS idx_logs_created ON task_logs(created_at);
 `);
+
+// 轻量迁移：老数据库可能缺少续期相关列，逐列补齐（幂等）
+{
+  const existing = new Set(
+    db.prepare("PRAGMA table_info(tokens)").all().map((c) => c.name),
+  );
+  const additions = {
+    source_url: "TEXT",
+    comb_user: "TEXT",
+    bin_data: "TEXT",
+    role_id: "TEXT",
+    server_id: "TEXT",
+    role_index: "INTEGER",
+    last_refreshed: "TEXT",
+  };
+  for (const [col, type] of Object.entries(additions)) {
+    if (!existing.has(col)) {
+      db.exec(`ALTER TABLE tokens ADD COLUMN ${col} ${type}`);
+    }
+  }
+}
 
 const now = () => new Date().toISOString();
 
@@ -123,8 +152,9 @@ export function getEnabledTokens() {
     .map(tokenRow);
 }
 
-export function insertToken(input) {
-  const row = {
+// 把输入对象规整成 tokens 表的完整行（含续期凭证字段）
+function normalizeTokenInput(input) {
+  return {
     id: String(input.id),
     name: input.name ?? null,
     token: input.token,
@@ -134,53 +164,85 @@ export function insertToken(input) {
     level: input.level ?? 1,
     profession: input.profession ?? null,
     import_method: input.import_method ?? null,
-    enabled: input.enabled === false ? 0 : 1,
+    enabled: input.enabled === false || input.enabled === 0 ? 0 : 1,
     created_at: input.created_at ?? now(),
     last_used: input.last_used ?? null,
+    source_url: input.source_url ?? null,
+    comb_user: input.comb_user ?? null,
+    bin_data: input.bin_data ?? null,
+    role_id: input.role_id ?? null,
+    server_id: input.server_id ?? null,
+    role_index: input.role_index ?? null,
+    last_refreshed: input.last_refreshed ?? null,
   };
-  db.prepare(`
-    INSERT INTO tokens (id, name, token, ws_url, remark, server, level,
-      profession, import_method, enabled, created_at, last_used)
-    VALUES (@id, @name, @token, @ws_url, @remark, @server, @level,
-      @profession, @import_method, @enabled, @created_at, @last_used)
-  `).run(row);
+}
+
+const TOKEN_COLUMNS = [
+  "id", "name", "token", "ws_url", "remark", "server", "level",
+  "profession", "import_method", "enabled", "created_at", "last_used",
+  "source_url", "comb_user", "bin_data", "role_id", "server_id",
+  "role_index", "last_refreshed",
+];
+
+export function insertToken(input) {
+  const row = normalizeTokenInput(input);
+  const cols = TOKEN_COLUMNS.join(", ");
+  const slots = TOKEN_COLUMNS.map((c) => `@${c}`).join(", ");
+  db.prepare(`INSERT INTO tokens (${cols}) VALUES (${slots})`).run(row);
   return tokenRow(row);
 }
 
+export function getToken(id) {
+  return tokenRow(
+    db.prepare("SELECT * FROM tokens WHERE id = ?").get(String(id)),
+  );
+}
+
 export function upsertTokens(rows) {
+  const cols = TOKEN_COLUMNS.join(", ");
+  const slots = TOKEN_COLUMNS.map((c) => `@${c}`).join(", ");
+  // 续期凭证字段：仅当同步端确实带来了新值(excluded 非 NULL)时才覆盖，
+  // 避免一次不带凭证的同步把已有的 bin_data 冲掉。
+  const updateCols = TOKEN_COLUMNS.filter((c) => c !== "id" && c !== "created_at");
+  const setClause = updateCols
+    .map((c) => {
+      if (["source_url", "comb_user", "bin_data", "role_id", "server_id", "role_index"].includes(c)) {
+        return `${c} = COALESCE(excluded.${c}, tokens.${c})`;
+      }
+      return `${c} = excluded.${c}`;
+    })
+    .join(",\n      ");
   const stmt = db.prepare(`
-    INSERT INTO tokens (id, name, token, ws_url, server, import_method,
-      level, enabled, created_at, last_used)
-    VALUES (@id, @name, @token, @ws_url, @server, @import_method,
-      @level, @enabled, @created_at, @last_used)
+    INSERT INTO tokens (${cols})
+    VALUES (${slots})
     ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      token = excluded.token,
-      ws_url = excluded.ws_url,
-      server = excluded.server,
-      import_method = excluded.import_method,
-      level = excluded.level,
-      enabled = excluded.enabled,
-      last_used = excluded.last_used
+      ${setClause}
   `);
   const run = db.transaction((list) => {
-    for (const t of list) {
-      stmt.run({
-        id: String(t.id),
-        name: t.name ?? null,
-        token: t.token,
-        ws_url: t.ws_url ?? null,
-        server: t.server ?? null,
-        import_method: t.import_method ?? null,
-        level: t.level ?? 1,
-        enabled: t.enabled === false ? 0 : 1,
-        created_at: t.created_at ?? now(),
-        last_used: t.last_used ?? null,
-      });
-    }
+    for (const t of list) stmt.run(normalizeTokenInput(t));
   });
   run(rows);
   return rows.length;
+}
+
+/** 记录 token 最近一次被任务使用的时间 */
+export function updateTokenLastUsed(id) {
+  db.prepare("UPDATE tokens SET last_used = ? WHERE id = ?").run(now(), String(id));
+}
+
+/** 续期成功后回写新的 roleToken（不覆盖凭证字段） */
+export function updateTokenCredential(id, { token, last_refreshed }) {
+  const fields = [];
+  const values = [];
+  if (token != null) {
+    fields.push("token = ?");
+    values.push(token);
+  }
+  fields.push("last_refreshed = ?");
+  values.push(last_refreshed ?? now());
+  values.push(String(id));
+  db.prepare(`UPDATE tokens SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+  return getToken(id);
 }
 
 export function deleteToken(id) {
